@@ -15,6 +15,11 @@ except Exception as e:
         "pyarrow is required for Parquet archiving. Install: pip install pyarrow pandas"
     ) from e
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 
 def _utc_date_str_from_ms(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -31,6 +36,24 @@ def _decode_dict(d: Dict[Any, Any]) -> Dict[str, str]:
     for k, v in d.items():
         out[str(_decode(k))] = str(_decode(v))
     return out
+
+
+def _validate_tz_name(tz_name: str) -> str:
+    """
+    Validate IANA timezone name for ARCHIVE_TZ. Falls back to UTC if invalid.
+    """
+    tz_name = (tz_name or "UTC").strip()
+    if tz_name.upper() == "UTC":
+        return "UTC"
+    if ZoneInfo is None:
+        print("[ARCHIVER] zoneinfo not available; falling back to UTC")
+        return "UTC"
+    try:
+        ZoneInfo(tz_name)  # validate
+        return tz_name
+    except Exception:
+        print(f"[ARCHIVER] invalid ARCHIVE_TZ={tz_name!r}; falling back to UTC")
+        return "UTC"
 
 
 class StreamParquetArchiver:
@@ -81,6 +104,10 @@ class StreamParquetArchiver:
         self._buf_rows: List[Dict[str, Any]] = []
         self._buf_ids: List[str] = []
         self._last_flush = time.time()
+
+        # Controls which "day" each message is assigned to (default: UTC).
+        # Example: ARCHIVE_TZ=Asia/Kolkata
+        self.partition_tz = _validate_tz_name(os.getenv("ARCHIVE_TZ", "UTC"))
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_group()
@@ -144,29 +171,33 @@ class StreamParquetArchiver:
             df["ts_recv"] = int(time.time() * 1000)
         df["ts_recv"] = pd.to_numeric(df["ts_recv"], errors="coerce").fillna(int(time.time() * 1000)).astype("int64")
 
-        # Determine dt partition from first row
-        dt_str = _utc_date_str_from_ms(int(df["ts_recv"].iloc[0]))
-
         # Stream partition name safe for folders
         stream_folder = f"stream={self.stream.replace(':', '_')}"
-        base = self.out_dir / stream_folder / f"dt={dt_str}"
 
         # Optional: partition by underlying/symbol
+        key_col: Optional[str] = None
         if self.partition_by_symbol:
-            key_col: Optional[str] = None
             for cand in ("underlying", "symbol"):
                 if cand in df.columns:
                     key_col = cand
                     break
 
-            if key_col:
-                for key, part in df.groupby(key_col):
-                    sub = base / f"{key_col}={str(key)}"
-                    self._append_parquet(sub, part)
-                return
+        # IMPORTANT: compute dt per row (so batches that span midnight land in the right folder)
+        ts = pd.to_datetime(df["ts_recv"], unit="ms", utc=True)
+        if self.partition_tz != "UTC":
+            ts = ts.dt.tz_convert(self.partition_tz)
+        df["_dt"] = ts.dt.strftime("%Y-%m-%d")
 
-        # If no key col, write one file per flush
-        self._append_parquet(base, df)
+        for dt_str, part_dt in df.groupby("_dt", sort=True):
+            part_dt = part_dt.drop(columns=["_dt"], errors="ignore")
+            base = self.out_dir / stream_folder / f"dt={dt_str}"
+
+            if key_col:
+                for key, part_sym in part_dt.groupby(key_col, sort=False):
+                    sub = base / f"{key_col}={str(key)}"
+                    self._append_parquet(sub, part_sym)
+            else:
+                self._append_parquet(base, part_dt)
 
     # ---------------------------
     # Buffering + ACK
